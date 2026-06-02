@@ -94,7 +94,9 @@
 #define CH182_LINK_UP_INTVAL_MS 200
 #define CH182_LINK_DOWN_INTVAL_MS 300
 #define CH182_BMCR_RESET_CLEAR 0x3100
-#define CH182_DEBUG 0
+#define CH182_FLOW_DEBUG 0
+#define CH182_REG_DEBUG 0
+#define CH182_RECOVERY_DEBUG 0
 #define CH182_DBG_FLOW "CH182_FLOW"
 #define CH182_DBG_REG "CH182_REG"
 #define CH182_DBG_RECOVERY "CH182_RECOVERY"
@@ -129,7 +131,6 @@ struct ch182_priv {
 	const struct ch182_led_type *type;
 	int led_tmode, led0_mode, led1_mode;
 	bool has_valid_led_values;
-	bool check_flag;
 	enum ch182_monitor_state monitor_state;
 	unsigned int monitor_seq;
 	struct mutex monitor_lock;
@@ -137,23 +138,31 @@ struct ch182_priv {
 	struct delayed_work monitor_work;
 };
 
-#if CH182_DEBUG
+#if CH182_FLOW_DEBUG
 #define ch182_flow_dbg(_phydev, _fmt, ...)                               \
 	dev_info(CH182_PHY_DEV(_phydev), "%s %s: " _fmt, CH182_DBG_FLOW, \
-		 __func__, ##__VA_ARGS__)
-#define ch182_reg_dbg(_phydev, _fmt, ...)                               \
-	dev_info(CH182_PHY_DEV(_phydev), "%s %s: " _fmt, CH182_DBG_REG, \
-		 __func__, ##__VA_ARGS__)
-#define ch182_recovery_dbg(_phydev, _fmt, ...)                               \
-	dev_info(CH182_PHY_DEV(_phydev), "%s %s: " _fmt, CH182_DBG_RECOVERY, \
 		 __func__, ##__VA_ARGS__)
 #else
 #define ch182_flow_dbg(_phydev, _fmt, ...) \
 	do {                               \
 	} while (0)
+#endif
+
+#if CH182_REG_DEBUG
+#define ch182_reg_dbg(_phydev, _fmt, ...)                               \
+	dev_info(CH182_PHY_DEV(_phydev), "%s %s: " _fmt, CH182_DBG_REG, \
+		 __func__, ##__VA_ARGS__)
+#else
 #define ch182_reg_dbg(_phydev, _fmt, ...) \
 	do {                              \
 	} while (0)
+#endif
+
+#if CH182_RECOVERY_DEBUG
+#define ch182_recovery_dbg(_phydev, _fmt, ...)                               \
+	dev_info(CH182_PHY_DEV(_phydev), "%s %s: " _fmt, CH182_DBG_RECOVERY, \
+		 __func__, ##__VA_ARGS__)
+#else
 #define ch182_recovery_dbg(_phydev, _fmt, ...) \
 	do {                                   \
 	} while (0)
@@ -290,20 +299,23 @@ static bool ch182_monitor_active(struct ch182_priv *priv,
 				 unsigned int seq)
 {
 	/* A worker is valid only while its state and generation still match. */
-	return READ_ONCE(priv->check_flag) &&
-	       READ_ONCE(priv->monitor_state) == state &&
+	return READ_ONCE(priv->monitor_state) == state &&
 	       READ_ONCE(priv->monitor_seq) == seq;
 }
 
-static void ch182_monitor_set(struct ch182_priv *priv,
-			      enum ch182_monitor_state state,
-			      unsigned int delay_ms)
+static void ch182_monitor_queue(struct ch182_priv *priv,
+				enum ch182_monitor_state state,
+				unsigned int delay_ms, bool allow_start)
 {
 	bool queue = false;
 
 	mutex_lock(&priv->monitor_lock);
 
-	if (READ_ONCE(priv->check_flag) && priv->wq) {
+	if (priv->wq && state != CH182_MONITOR_STOPPED) {
+		if (!allow_start &&
+		    priv->monitor_state == CH182_MONITOR_STOPPED)
+			goto out;
+
 		/* Repeated same-state notifications must not postpone checks. */
 		if (priv->monitor_state != state) {
 			WRITE_ONCE(priv->monitor_state, state);
@@ -327,7 +339,22 @@ static void ch182_monitor_set(struct ch182_priv *priv,
 					 msecs_to_jiffies(delay_ms));
 	}
 
+out:
 	mutex_unlock(&priv->monitor_lock);
+}
+
+static void ch182_monitor_start(struct ch182_priv *priv,
+				enum ch182_monitor_state state,
+				unsigned int delay_ms)
+{
+	ch182_monitor_queue(priv, state, delay_ms, true);
+}
+
+static void ch182_monitor_set(struct ch182_priv *priv,
+			      enum ch182_monitor_state state,
+			      unsigned int delay_ms)
+{
+	ch182_monitor_queue(priv, state, delay_ms, false);
 }
 
 static void ch182_monitor_requeue(struct ch182_priv *priv,
@@ -347,7 +374,6 @@ static void ch182_monitor_requeue(struct ch182_priv *priv,
 static void ch182_monitor_stop(struct ch182_priv *priv)
 {
 	mutex_lock(&priv->monitor_lock);
-	WRITE_ONCE(priv->check_flag, false);
 	WRITE_ONCE(priv->monitor_state, CH182_MONITOR_STOPPED);
 	WRITE_ONCE(priv->monitor_seq, priv->monitor_seq + 1);
 	mutex_unlock(&priv->monitor_lock);
@@ -381,8 +407,8 @@ static int ch182_config_init(struct phy_device *phydev)
 	if (ret < 0)
 		return ret;
 
-	ch182_monitor_set(priv, CH182_MONITOR_LINK_DOWN,
-			  CH182_LINK_DOWN_INTVAL_MS);
+	ch182_monitor_start(priv, CH182_MONITOR_LINK_DOWN,
+			    CH182_LINK_DOWN_INTVAL_MS);
 
 	return 0;
 }
@@ -398,14 +424,6 @@ static void ch182_linkdown_cfg(struct ch182_priv *priv)
 			  CH182_LINK_DOWN_INTVAL_MS);
 }
 
-static void ch182_monitor_set_link_state(struct ch182_priv *priv, int link)
-{
-	if (link)
-		ch182_linkup_cfg(priv);
-	else
-		ch182_linkdown_cfg(priv);
-}
-
 static void ch182_link_change(struct phy_device *phydev)
 {
 	struct ch182_priv *priv = phydev->priv;
@@ -414,14 +432,18 @@ static void ch182_link_change(struct phy_device *phydev)
 	if (!priv)
 		return;
 
-	if (!READ_ONCE(priv->check_flag) || !priv->wq)
+	if (READ_ONCE(priv->monitor_state) == CH182_MONITOR_STOPPED ||
+	    !priv->wq)
 		return;
 
 	link = phydev->link;
 	ch182_flow_dbg(phydev, "link notify link=%d speed=%d\n", link,
 		       phydev->speed);
 
-	ch182_monitor_set_link_state(priv, link);
+	if (link)
+		ch182_linkup_cfg(priv);
+	else
+		ch182_linkdown_cfg(priv);
 }
 
 static int ch182_soft_reset(struct phy_device *phydev)
@@ -487,7 +509,7 @@ static int ch182_modify_page0_locked(struct phy_device *phydev, u32 regnum,
 static void ch182_set_phypn(struct phy_device *phydev)
 {
 	struct mii_bus *bus = CH182_PHY_BUS(phydev);
-	int ret;
+	int ret, restore_ret;
 
 	ch182_recovery_dbg(phydev, "trigger ch182_set_phypn\n");
 
@@ -528,11 +550,12 @@ static void ch182_set_phypn(struct phy_device *phydev)
 		goto out;
 	}
 
-	ret = ch182_mdio_write(phydev, PHY_PAG_SEL, PHY_PAG0);
-	if (ret < 0)
-		phydev_err(phydev, "failed to restore PHY page0: %d\n", ret);
-
 out:
+	restore_ret = ch182_mdio_write(phydev, PHY_PAG_SEL, PHY_PAG0);
+	if (restore_ret < 0)
+		phydev_err(phydev, "failed to restore PHY page0: %d\n",
+			   restore_ret);
+
 	mutex_unlock(&bus->mdio_lock);
 }
 
@@ -559,9 +582,6 @@ static void ch182_check_link(struct phy_device *phydev, struct ch182_priv *priv,
 	int link, speed;
 
 	for (i = 5; i > 0; i--) {
-		if (!ch182_monitor_active(priv, CH182_MONITOR_LINK_UP, seq))
-			return;
-
 		val = ch182_page_read(phydev, PHY_PAG0, CH182_PHY_STATUS0);
 		if (val < 0)
 			return;
@@ -577,9 +597,6 @@ static void ch182_check_link(struct phy_device *phydev, struct ch182_priv *priv,
 	}
 
 	if (count == 5) {
-		if (!ch182_monitor_active(priv, CH182_MONITOR_LINK_UP, seq))
-			return;
-
 		link = ch182_check_link_stat(phydev);
 		speed = ch182_check_link_speed(phydev);
 		ch182_flow_dbg(phydev,
@@ -628,9 +645,6 @@ static void ch182_check_phypn(struct phy_device *phydev,
 	else
 		delay_ms = 200;
 
-	if (!ch182_monitor_active(priv, CH182_MONITOR_LINK_DOWN, seq))
-		return;
-
 	phy_stat = ch182_page_read(phydev, PHY_PAG0, CH182_PHY_STATUS0);
 	if (phy_stat < 0) {
 		phydev_err(phydev, "failed to read phy status0: %d\n",
@@ -643,9 +657,6 @@ static void ch182_check_phypn(struct phy_device *phydev,
 		mutex_unlock(&phydev->lock);
 		msleep(delay_ms);
 		mutex_lock(&phydev->lock);
-
-		if (!ch182_monitor_active(priv, CH182_MONITOR_LINK_DOWN, seq))
-			return;
 
 		link = ch182_check_link_stat(phydev);
 		ch182_reg_dbg(
@@ -671,21 +682,13 @@ static void ch182_check_phypn(struct phy_device *phydev,
 static void ch182_link_processing(struct phy_device *phydev,
 				  struct ch182_priv *priv, unsigned int seq)
 {
-	int link;
 	int phy_bcr;
-
-	if (!ch182_monitor_active(priv, CH182_MONITOR_LINK_DOWN, seq))
-		return;
-
-	link = ch182_check_link_stat(phydev);
-	if (link != 0)
-		return;
 
 	phy_bcr = phy_read(phydev, MII_BMCR);
 	if (phy_bcr < 0)
 		return;
 
-	ch182_reg_dbg(phydev, "bmcr=0x%04x link=%d\n", phy_bcr & 0xffff, link);
+	ch182_reg_dbg(phydev, "bmcr=0x%04x\n", phy_bcr & 0xffff);
 
 	if (phy_bcr & BMCR_ANENABLE)
 		ch182_check_phypn(phydev, priv, seq, true);
@@ -699,8 +702,7 @@ static int ch182_monitor_snapshot(struct ch182_priv *priv,
 {
 	mutex_lock(&priv->monitor_lock);
 
-	if (!READ_ONCE(priv->check_flag) ||
-	    priv->monitor_state == CH182_MONITOR_STOPPED) {
+	if (priv->monitor_state == CH182_MONITOR_STOPPED) {
 		mutex_unlock(&priv->monitor_lock);
 		return -ECANCELED;
 	}
@@ -735,16 +737,15 @@ static void ch182_monitor_work(struct work_struct *work)
 	switch (state) {
 	case CH182_MONITOR_LINK_DOWN:
 		link = ch182_check_link_stat(phydev);
-		if (link == 0)
+		if (link == 0) {
 			ch182_link_processing(phydev, priv, seq);
-
-		if (ch182_monitor_active(priv, state, seq))
 			link = ch182_check_link_stat(phydev);
+		}
 
 		ch182_flow_dbg(phydev, "link-down worker link=%d seq=%u\n",
 			       link, seq);
 
-		if (ch182_monitor_active(priv, state, seq) && link <= 0) {
+		if (link <= 0) {
 			delay_ms = CH182_LINK_DOWN_INTVAL_MS;
 			requeue = true;
 		}
@@ -754,14 +755,13 @@ static void ch182_monitor_work(struct work_struct *work)
 		if (speed > 0)
 			ch182_check_link(phydev, priv, seq);
 
-		if (ch182_monitor_active(priv, state, seq))
-			link = ch182_check_link_stat(phydev);
+		link = ch182_check_link_stat(phydev);
 
 		ch182_flow_dbg(phydev,
 			       "link-up worker link=%d speed=%d seq=%u\n", link,
 			       speed, seq);
 
-		if (ch182_monitor_active(priv, state, seq) && link != 0) {
+		if (link != 0) {
 			delay_ms = CH182_LINK_UP_INTVAL_MS;
 			requeue = true;
 		}
@@ -809,7 +809,6 @@ static int ch182_probe(struct phy_device *phydev)
 	mutex_init(&priv->monitor_lock);
 	WRITE_ONCE(priv->monitor_state, CH182_MONITOR_STOPPED);
 	WRITE_ONCE(priv->monitor_seq, 0);
-	WRITE_ONCE(priv->check_flag, true);
 	priv->wq = alloc_workqueue("ch182_wq", WQ_MEM_RECLAIM, 1);
 	if (!priv->wq) {
 		phydev_err(phydev, "failed to create workqueue\n");
@@ -895,8 +894,12 @@ static int ch182_suspend(struct phy_device *phydev)
 
 	ret = genphy_suspend(phydev);
 	if (ret < 0 && priv) {
-		WRITE_ONCE(priv->check_flag, true);
-		ch182_monitor_set_link_state(priv, phydev->link);
+		if (phydev->link)
+			ch182_monitor_start(priv, CH182_MONITOR_LINK_UP,
+					    CH182_LINK_UP_INTVAL_MS);
+		else
+			ch182_monitor_start(priv, CH182_MONITOR_LINK_DOWN,
+					    CH182_LINK_DOWN_INTVAL_MS);
 	}
 
 	return ret;
@@ -913,9 +916,8 @@ static int ch182_resume(struct phy_device *phydev)
 
 	if (priv) {
 		ch182_flow_dbg(phydev, "resume\n");
-		WRITE_ONCE(priv->check_flag, true);
-		ch182_monitor_set(priv, CH182_MONITOR_LINK_DOWN,
-				  CH182_LINK_DOWN_INTVAL_MS);
+		ch182_monitor_start(priv, CH182_MONITOR_LINK_DOWN,
+				    CH182_LINK_DOWN_INTVAL_MS);
 	}
 
 	return 0;
